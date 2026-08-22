@@ -1,0 +1,21 @@
+{
+  "name": "better-songify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Buildable BetterSongify extension for Spotify UI improvements: lyric translation, transliteration, video preferences, and more.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "node tools/build.js",
+    "build:desktop": "node tools/build.js --target=desktop",
+    "build:chrome": "node tools/build.js --target=chrome",
+    "build:notifier": "bash tools/build-notifier-app.sh",
+    "verify:notifier": "bash tools/verify-notifier-app.sh",
+    "test:notifier": "bash tools/test-notifier-transport.sh",
+    "notifier": "open -g dist/BetterSongifyNotifier.app",
+    "notifier:debug": "BS_NOTIFIER_DEBUG=1 open -g dist/BetterSongifyNotifier.app",
+    "check": "node --check src/index.js && node --check src/chrome/background.js && npm run build && node --check dist/BetterSongify.js && node --check dist/chrome/content.js && node --check dist/chrome/background.js",
+    "install:macos": "bash install-macos.sh install",
+    "reinstall:macos": "bash install-macos.sh reinstall",
+    "remove:macos": "bash install-macos.sh remove"
+  }
+}

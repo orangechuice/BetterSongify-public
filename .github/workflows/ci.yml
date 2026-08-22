@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: No private files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repo is exported from a private working repo. The export is
+      # allowlist-driven, so this should never fire — it exists to catch a
+      # hand-edit or a bad merge, where the allowlist offers no protection.
+      # Keep in sync with FORBIDDEN_PATHS/GLOBS/PATTERNS in the exporter.
+      - name: Check for files that must never be published
+        run: |
+          fail=0
+          for p in .claude/settings.local.json .claude/RESUME.md original dist \
+                   tools/export-public.sh tools/notifier.js tools/notifier-launch.sh; do
+            if [ -e "$p" ]; then
+              echo "::error::$p must not exist in the public repo"
+              fail=1
+            fi
+          done
+          # Assembled as "$n.md" rather than written out, so that this file does
+          # not itself contain the literal filenames it forbids — the exporter
+          # greps the whole mirror for them and would flag its own guard.
+          for n in AGENTS CLAUDE; do
+            if [ -e "$n.md" ]; then
+              echo "::error::$n.md must not exist in the public repo"
+              fail=1
+            fi
+          done
+          for f in $(git ls-files '*.pem' '*.key' '*.p12' '*.keychain-db' \
+                                  '.env' '.env.*' '.DS_Store' '*.spa' \
+                                  'xpui.spa*' 'BetterSongify_Extraction.*'); do
+            echo "::error file=$f::$f must not be committed"
+            fail=1
+          done
+          # The architecture notes are private, so a comment pointing at them
+          # would send readers of this repo to a file that does not exist here.
+          if git grep -nIE '(AGENTS|CLAUDE)\.md' -- . ; then
+            echo "::error::source must not reference the private architecture notes"
+            fail=1
+          fi
+          if git grep -nIE '(/Users/[a-z]|/home/[a-z]|[a-z.]+@gmail\.com)' -- . ; then
+            echo "::error::source must not contain home-directory paths or personal email"
+            fail=1
+          fi
+          exit $fail
+
+  build:
+    name: Build and syntax-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # No dependencies and no credentials: the build is plain Node, and the
+      # macOS companion is signed ad-hoc. A clean checkout must build as-is.
+      - name: Build both targets and syntax-check output
+        run: npm run check
+
+  notifier:
+    name: macOS companion
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # macos-latest ships the Swift toolchain, and build-notifier-app.sh signs
+      # ad-hoc (`codesign --sign -`), so this needs no secrets and reproduces a
+      # local build exactly.
+      - name: Build the companion
+        run: npm run build:notifier
+
+      - name: Verify the bundle
+        run: npm run verify:notifier
+
+      # Exercises the loopback parser in --transport-test mode: no AppKit, no
+      # Spotify query, no notification posted. Safe on a headless runner.
+      - name: Exercise the loopback transport
+        run: npm run test:notifier

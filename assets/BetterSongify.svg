@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 180" role="img" aria-labelledby="title desc">
+  <title id="title">BetterSongify wordmark</title>
+  <desc id="desc">BetterSongify set as a rounded, bold, Spotify-green wordmark.</desc>
+  <defs>
+    <style>
+      .wordmark {
+        fill: #1db954;
+        font-family: "Spotify Mix", "Circular Std", "Circular", "Avenir Next", "Arial Rounded MT Bold", "Helvetica Neue", Arial, sans-serif;
+        font-size: 112px;
+        font-weight: 900;
+        letter-spacing: 0;
+      }
+    </style>
+  </defs>
+  <text class="wordmark" x="34" y="130">BetterSongify</text>
+</svg>
