@@ -1,6 +1,6 @@
 {
   "name": "better-songify",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Buildable BetterSongify extension for Spotify UI improvements: lyric translation, transliteration, video preferences, and more.",
   "type": "commonjs",
