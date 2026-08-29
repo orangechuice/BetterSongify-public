@@ -548,6 +548,12 @@ final class MarqueeStatusView: NSView {
     static let iconGap: CGFloat = 6
     static let trailingInset: CGFloat = 8
     static let iconWidth: CGFloat = 14
+    // Cover art sits between the status symbol and the title. Its slot exists
+    // while there is either art or a download to wait for, and collapses
+    // otherwise: a permanently empty tile in the menu bar reads as a broken
+    // image rather than as "no artwork".
+    static let artworkSide: CGFloat = 15
+    static let artworkGap: CGFloat = 5
     private static let pointsPerSecond: CGFloat = 26
     // Dwell happens only at the start of the title, never at the end.
     private static let startDwell: TimeInterval = 5
@@ -564,6 +570,7 @@ final class MarqueeStatusView: NSView {
     private static let progressHeight: CGFloat = 2
     private static let progressBottomInset: CGFloat = 2
 
+    private let artworkView = NSImageView()
     private let iconView = NSImageView()
     private let textView = MarqueeTextView(frame: .zero)
     private let progressView = ProgressBarView()
@@ -577,6 +584,12 @@ final class MarqueeStatusView: NSView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
+        artworkView.imageScaling = .scaleProportionallyUpOrDown
+        artworkView.wantsLayer = true
+        artworkView.layer?.cornerRadius = 3
+        artworkView.layer?.masksToBounds = true
+        artworkView.isHidden = true
+        addSubview(artworkView)
         iconView.imageScaling = .scaleProportionallyDown
         addSubview(iconView)
         addSubview(textView)
@@ -593,9 +606,17 @@ final class MarqueeStatusView: NSView {
         let side = MarqueeStatusView.iconWidth
         let reserved = MarqueeStatusView.progressHeight + MarqueeStatusView.progressBottomInset
         let contentHeight = max(0, bounds.height - reserved)
-        iconView.frame = NSRect(x: MarqueeStatusView.leadingInset, y: (contentHeight - side) / 2, width: side, height: side)
-        textView.frame = NSRect(x: iconView.frame.maxX + MarqueeStatusView.iconGap, y: 0,
-                                width: max(0, bounds.width - iconView.frame.maxX - MarqueeStatusView.iconGap - MarqueeStatusView.trailingInset),
+        // Play/pause, then cover art, then the title: the symbol is chrome and
+        // stays pinned to the item's edge, so it does not move when art appears
+        // or goes away — only the art and the title shift.
+        var x = MarqueeStatusView.leadingInset
+        iconView.frame = NSRect(x: x, y: (contentHeight - side) / 2, width: side, height: side)
+        x = iconView.frame.maxX + MarqueeStatusView.iconGap
+        let art = MarqueeStatusView.artworkSide
+        artworkView.frame = NSRect(x: x, y: (contentHeight - art) / 2, width: art, height: art)
+        if !artworkView.isHidden { x += art + MarqueeStatusView.artworkGap }
+        textView.frame = NSRect(x: x, y: 0,
+                                width: max(0, bounds.width - x - MarqueeStatusView.trailingInset),
                                 height: contentHeight)
         // Spans icon and title together — it is the whole item's progress, not
         // the label's.
@@ -607,6 +628,17 @@ final class MarqueeStatusView: NSView {
 
     static func measure(_ text: String) -> CGFloat {
         ceil((text as NSString).size(withAttributes: [.font: NSFont.menuBarFont(ofSize: 0)]).width)
+    }
+
+    // What the thumbnail and its gap cost the row.
+    static let artworkWidth: CGFloat = artworkSide + artworkGap
+
+    // Everything the item needs around the title. The owner sizes the item
+    // from this, so cover art appearing or going away has to be part of it or
+    // the artwork would push the title out past the item's right edge.
+    static func chromeWidth(hasArtwork: Bool) -> CGFloat {
+        leadingInset + (hasArtwork ? artworkWidth : 0)
+            + iconWidth + iconGap + trailingInset
     }
 
     func update(text: String, symbol: String, accessibility: String, playing: Bool) {
@@ -627,6 +659,25 @@ final class MarqueeStatusView: NSView {
         offset = 0; dwellUntil = Date().addingTimeInterval(MarqueeStatusView.startDwell)
         applyColors()
         syncScrollState()
+    }
+
+    // Cover art is set on its own for the same reason as progress: it arrives
+    // from a download that finishes well after the title it belongs to, so it
+    // cannot ride along on the title update. Three states, not two: art, a
+    // placeholder box while the download is in flight, and no slot at all when
+    // there is no art to wait for. The placeholder is what keeps the title from
+    // sliding sideways when the image lands — the slot is already the width the
+    // art will need, and only its contents change.
+    func setArtwork(_ artwork: NSImage?, loading: Bool) {
+        let occupied = artwork != nil || loading
+        guard artwork !== artworkView.image || occupied == artworkView.isHidden else { return }
+        artworkView.image = artwork
+        artworkView.isHidden = !occupied
+        // Drawn as the layer's own fill rather than a generated image: it is
+        // then exactly the rounded rect the art will occupy, with no second
+        // piece of geometry to keep in step with `artworkSide`.
+        artworkView.layer?.backgroundColor = artwork == nil && loading ? NSColor.white.cgColor : nil
+        needsLayout = true
     }
 
     // Progress is set on its own rather than through update(text:…), which
@@ -751,7 +802,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.items.forEach { $0.target = $0.target ?? self }
         menu.delegate = self
         item.menu = menu
-        artworkLoader.onImage = { [weak self] in self?.renderNowPlaying() }
+        artworkLoader.onImage = { [weak self] in self?.renderNowPlaying(); self?.render() }
         render()
     }
 
@@ -796,8 +847,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     // its menu-bar neighbours stay put while the text moves inside it.
     private func render() {
         let text = snapshot.marqueeText
-        let chrome = MarqueeStatusView.leadingInset + MarqueeStatusView.iconWidth + MarqueeStatusView.iconGap + MarqueeStatusView.trailingInset
-        let textWidth = min(max(StatusItemController.minTextWidth, MarqueeStatusView.measure(text)), StatusItemController.maxTextWidth)
+        let artwork = artworkLoader.image
+        // A slot in flight costs exactly what a filled one costs, so the width
+        // is settled once when the track changes rather than again when its art
+        // arrives.
+        let hasArtworkSlot = artwork != nil || artworkLoader.isLoading
+        marqueeView.setArtwork(artwork, loading: artworkLoader.isLoading)
+        let chrome = MarqueeStatusView.chromeWidth(hasArtwork: hasArtworkSlot)
+        // The thumbnail is measured as part of the content, before the clamp,
+        // not subtracted from the title's share after it. Subtracting after
+        // leaves every title in a slot 20 pt narrower than the title itself,
+        // so nothing ever fits and everything scrolls — including titles that
+        // sat still before there was art. Counting it as content instead means
+        // the row hugs art-plus-title when that is short enough to fit, and the
+        // 170 pt cap still bounds the pair, so the item's widest state is the
+        // 204 pt it was before art existed.
+        let artworkWidth = hasArtworkSlot ? MarqueeStatusView.artworkWidth : 0
+        let content = MarqueeStatusView.measure(text) + artworkWidth
+        let budget = min(max(StatusItemController.minTextWidth, content), StatusItemController.maxTextWidth)
+        let textWidth = max(0, budget - artworkWidth)
         item.length = chrome + textWidth
         marqueeView.update(text: text, symbol: snapshot.status.symbol, accessibility: snapshot.status.text, playing: snapshot.status == .playing)
         item.button?.toolTip = text
@@ -823,6 +891,11 @@ final class MenuArtworkLoader {
     private var currentURL: String?
     private var delivery: NotificationDelivery?
     private(set) var image: NSImage?
+    // True from the moment a track with art is known until that art has either
+    // arrived or failed. The status item reserves its slot on this, so it must
+    // be settled on every exit from the download — a path that leaves it true
+    // pins a placeholder in the menu bar forever.
+    private(set) var isLoading = false
     var onImage: (() -> Void)?
 
     func load(_ url: String?) {
@@ -832,17 +905,29 @@ final class MenuArtworkLoader {
         cancel()
         currentURL = validated
         image = nil
+        // Set before the callback, not after: the slot has to go straight from
+        // the old track's art to the new track's placeholder. Publishing an
+        // interim "no art, not loading" would collapse the slot and shove the
+        // title sideways, then shove it back a moment later.
+        isLoading = validated != nil
         onImage?()
         guard let validated, let target = URL(string: validated) else { return }
         let delivery = NotificationDelivery()
         self.delivery = delivery
         ArtworkDownload(url: target, delivery: delivery) { [weak self] file in
-            guard let file else { return }
-            let loaded = NSImage(contentsOf: file)
-            discardArtworkFile(file)
+            let loaded = file.flatMap { path -> NSImage? in
+                let decoded = NSImage(contentsOf: path)
+                discardArtworkFile(path)
+                return decoded
+            }
             DispatchQueue.main.async {
-                // A newer track may have superseded this download in flight.
+                // A newer track may have superseded this download in flight; it
+                // owns the state now, including whether anything is loading.
                 guard let self, self.currentURL == validated else { return }
+                // Cleared even when the download failed or decoded to nothing,
+                // which is the whole reason this is not an early return: a dead
+                // download must drop the placeholder, not keep it.
+                self.isLoading = false
                 self.image = loaded
                 self.onImage?()
             }
@@ -852,6 +937,7 @@ final class MenuArtworkLoader {
     func cancel() {
         _ = delivery?.cancelIfPending()
         delivery = nil
+        isLoading = false
     }
 }
 
