@@ -59,8 +59,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   fetch(message.url)
-    .then((response) => response.json())
-    .then((payload) => sendResponse({ ok: true, payload }))
+    .then((response) => {
+      if (!response.ok) {
+        sendResponse({ ok: false, status: response.status, error: `HTTP ${response.status}` });
+        return;
+      }
+      return response.json().then((payload) => sendResponse({ ok: true, payload }));
+    })
     .catch((error) => sendResponse({ ok: false, error: String(error) }));
   return true; // keep sendResponse alive for the async fetch
 });

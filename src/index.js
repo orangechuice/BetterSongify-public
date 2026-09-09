@@ -159,6 +159,8 @@
     translations: new Map(),
     pending: new Set(),
     cache: loadCache(),
+    negativeCache: new Map(),
+    translationCooldownUntil: 0,
     transcript: [],
     currentSongTitle: "",
     currentArtist: "",
@@ -483,6 +485,10 @@
     return typeof chrome !== "undefined" && !!chrome.runtime?.id;
   }
 
+  const TRANSLATION_CONCURRENCY = 4;
+  const NEGATIVE_CACHE_LINE_MS = 60 * 1000;
+  const RATE_LIMIT_COOLDOWN_MS = 300 * 1000;
+
   // In the Chrome-extension build, content scripts are subject to the page's
   // CORS rules and cannot fetch translate.googleapis.com directly; the
   // background service worker (src/chrome/background.js) performs the fetch
@@ -491,11 +497,22 @@
   function fetchTranslationPayload(url) {
     if (isExtensionRuntime()) {
       return chrome.runtime.sendMessage({ type: "bs-translate", url }).then((reply) => {
-        if (!reply?.ok) throw new Error(reply?.error || "Translation request failed");
+        if (!reply?.ok) {
+          const err = new Error(reply?.error || "Translation request failed");
+          if (reply?.status) err.status = reply.status;
+          throw err;
+        }
         return reply.payload;
       });
     }
-    return fetch(url).then((response) => response.json());
+    return fetch(url).then((response) => {
+      if (!response.ok) {
+        const err = new Error(`HTTP ${response.status}`);
+        err.status = response.status;
+        throw err;
+      }
+      return response.json();
+    });
   }
 
   function parseGoogleTranslatePayload(payload) {
@@ -518,7 +535,7 @@
       async translate(text, targetLang) {
         const url = new URL("https://translate.googleapis.com/translate_a/single");
         const params = new URLSearchParams();
-        params.set("client", "gtx");
+        params.set("client", "dict-chrome-ex");
         params.set("sl", "auto");
         params.set("tl", targetLang);
         params.append("dt", "t");
@@ -536,13 +553,37 @@
     const cached = state.cache.get(cacheKey);
     if (Array.isArray(cached)) return { text: cached[0], romaji: cached[1] };
 
+    const now = Date.now();
+    if (now < state.translationCooldownUntil) return null;
+    const negativeUntil = state.negativeCache.get(cacheKey);
+    if (negativeUntil) {
+      if (now < negativeUntil) return null;
+      state.negativeCache.delete(cacheKey);
+    }
+
     try {
       const result = await TRANSLATION_PROVIDERS.googleAuto.translate(text, appSettings.targetLang);
-      if (!result) return null;
+      if (!result) {
+        state.negativeCache.set(cacheKey, Date.now() + NEGATIVE_CACHE_LINE_MS);
+        return null;
+      }
       state.cache.set(cacheKey, [result.text, result.romaji]);
       saveCache();
       return result;
-    } catch {
+    } catch (err) {
+      if (err?.status === 429 || Number(err?.status) === 429) {
+        state.translationCooldownUntil = Math.max(
+          state.translationCooldownUntil,
+          Date.now() + RATE_LIMIT_COOLDOWN_MS,
+        );
+      }
+      state.negativeCache.set(cacheKey, Date.now() + NEGATIVE_CACHE_LINE_MS);
+      if (state.negativeCache.size > 500) {
+        const pruneNow = Date.now();
+        for (const [key, expires] of state.negativeCache) {
+          if (pruneNow >= expires) state.negativeCache.delete(key);
+        }
+      }
       return null;
     }
   }
@@ -651,6 +692,19 @@
     return nodes.length > 0 && nodes.every(isLyricAnnotation);
   }
 
+  async function mapConcurrent(items, concurrency, fn) {
+    if (!items || !items.length) return;
+    const limit = Math.min(concurrency, items.length);
+    let index = 0;
+    const workers = Array.from({ length: limit }, async () => {
+      while (index < items.length) {
+        const current = index++;
+        await fn(items[current], current);
+      }
+    });
+    await Promise.all(workers);
+  }
+
   async function refreshLyrics() {
     updateBodyMode();
     enforceVideoFeatures();
@@ -667,6 +721,7 @@
     if (trackKey !== state.trackKey) {
       state.trackKey = trackKey;
       state.translations.clear();
+      state.pending.clear();
       state.transcript = [];
       detectSongMetadata();
     }
@@ -690,22 +745,48 @@
       translation: "",
     }));
 
-    const jobs = transcript.map(async (entry) => {
+    const uncached = [];
+    for (const entry of transcript) {
       const { id, line, text } = entry;
+      let translation = state.translations.get(id);
+      if (!translation) {
+        const cacheKey = `${appSettings.targetLang}\u0000${text}`;
+        const cached = state.cache.get(cacheKey);
+        if (Array.isArray(cached)) {
+          translation = { text: cached[0], romaji: cached[1] };
+          state.translations.set(id, translation);
+        }
+      }
+      if (translation) {
+        entry.translation = translation;
+        renderLyricAnnotation(line, entry);
+      } else {
+        uncached.push(entry);
+      }
+    }
+
+    await mapConcurrent(uncached, TRANSLATION_CONCURRENCY, async (entry) => {
+      const { id, line, text } = entry;
+      if (state.trackKey !== trackKey) return;
 
       let translation = state.translations.get(id);
       if (!translation && !state.pending.has(id)) {
         state.pending.add(id);
-        translation = await translateText(text);
-        state.pending.delete(id);
+        try {
+          translation = await translateText(text);
+        } finally {
+          state.pending.delete(id);
+        }
         if (translation) state.translations.set(id, translation);
       }
+      if (state.trackKey !== trackKey) return;
 
-      entry.translation = translation || null;
+      entry.translation = translation || state.translations.get(id) || null;
       renderLyricAnnotation(line, entry);
     });
 
-    await Promise.all(jobs);
+    if (state.trackKey !== trackKey) return;
+
     state.transcript = transcript.map((entry) => ({
       id: entry.id,
       text: entry.text,
