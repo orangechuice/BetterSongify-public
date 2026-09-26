@@ -485,6 +485,18 @@
     return typeof chrome !== "undefined" && !!chrome.runtime?.id;
   }
 
+  // tools/build.js flips this to false for `--no-notifier` desktop builds —
+  // installs made without BetterSongifyNotifier.app. Keep it on one line
+  // exactly as written, or the build throws.
+  const NOTIFIER_COMPANION_INSTALLED = true;
+
+  // True when this build has the resident macOS companion to talk to: the
+  // desktop build, unless it was installed without one. Everything that
+  // reaches the loopback endpoint or shows companion-only UI gates on this.
+  function hasNotifierCompanion() {
+    return !isExtensionRuntime() && NOTIFIER_COMPANION_INSTALLED;
+  }
+
   const TRANSLATION_CONCURRENCY = 4;
   const NEGATIVE_CACHE_LINE_MS = 60 * 1000;
   const RATE_LIMIT_COOLDOWN_MS = 300 * 1000;
@@ -887,8 +899,9 @@
   // before a notification appears (the poster backend — Spotify read, artwork
   // download, authorization-state check, post — measures ~0.17s). Desktop no
   // longer has to cover the mismatched-artist window because the helper reads
-  // the track from Spotify itself. Chrome notifications still display the
-  // scraped values, so that target keeps the more conservative delay.
+  // the track from Spotify itself. Chrome notifications — and the desktop toast
+  // in an install without the companion — still display the scraped values,
+  // so they keep the more conservative delay.
   const NOTIFY_DESKTOP_SETTLE_MS = 100;
   const NOTIFY_EXTENSION_SETTLE_MS = 250;
   // Whatever was already playing when the script loaded is not a song change:
@@ -915,7 +928,7 @@
 
       const { title, artist } = getNowPlayingTrack();
       if (title) showSongChangeNotification(title, artist, getNowPlayingArtwork());
-    }, isExtensionRuntime() ? NOTIFY_EXTENSION_SETTLE_MS : NOTIFY_DESKTOP_SETTLE_MS);
+    }, hasNotifierCompanion() ? NOTIFY_DESKTOP_SETTLE_MS : NOTIFY_EXTENSION_SETTLE_MS);
   }
 
   // Resident BetterSongifyNotifier menu-bar companion, the desktop build's
@@ -957,7 +970,7 @@
   // companion remembers the last value it was told, which is what keeps the
   // preference honoured at login, before Spotify's renderer runs this script.
   function syncMenuBarVisibility({ announce = false } = {}) {
-    if (isExtensionRuntime()) return;
+    if (!hasNotifierCompanion()) return;
     postToNotifier(NOTIFIER_MENU_BAR_ENDPOINT, { visible: !!appSettings.menuBarSong }).then((ok) => {
       if (ok || !announce) return;
       notify("Notifier companion isn't running — the menu bar item can't be changed.");
@@ -985,7 +998,8 @@
   //                    deliberately NOT tried here: it is unreachable in
   //                    Spotify's client (permission can never be granted) and
   //                    the helper is better anyway, since it reads the album
-  //                    and full-size art from Spotify.
+  //                    and full-size art from Spotify. Installed without the
+  //                    companion, it goes straight to the toast.
   // Either way, an unavailable transport lands on the in-app toast so an
   // enabled setting always produces something visible.
   async function showSongChangeNotification(title, artist, artwork) {
@@ -999,7 +1013,7 @@
         });
         if (reply?.ok) return;
       } catch {}
-    } else if (await postToLocalNotifier(title, artist, artwork)) {
+    } else if (hasNotifierCompanion() && await postToLocalNotifier(title, artist, artwork)) {
       return;
     }
     notify(artist ? `${title} — ${artist}` : title);
@@ -1488,7 +1502,7 @@
         <div class="better-songify-section">
           <div class="better-songify-section-title">Notifications</div>
           ${toggleRow("Notify On Song Change", "songChangeNotifications", "better-songify-song-notify")}
-          ${isExtensionRuntime() ? "" : toggleRow("Show Song In Menu Bar", "menuBarSong", "better-songify-menu-bar")}
+          ${hasNotifierCompanion() ? toggleRow("Show Song In Menu Bar", "menuBarSong", "better-songify-menu-bar") : ""}
         </div>
 
         <div class="better-songify-section" style="margin-top:auto">
@@ -1592,8 +1606,10 @@
           // Desktop only: say so up front if the companion that posts real macOS
           // notifications isn't listening, rather than letting the user
           // discover it one silent track change at a time. The Chrome build
-          // needs no such check — its permission comes from the manifest.
-          if (!isExtensionRuntime()) {
+          // needs no such check — its permission comes from the manifest — and
+          // neither does an install without the companion, where the toast is
+          // the notification by design rather than a fallback.
+          if (hasNotifierCompanion()) {
             probeLocalNotifier().then((running) => {
               if (running) return;
               notify("Notifier companion isn't running — song changes will show here instead.");

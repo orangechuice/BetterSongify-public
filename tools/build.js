@@ -45,9 +45,25 @@ function parseTargets(argv) {
   return requested.length ? [...new Set(requested)] : VALID_TARGETS;
 }
 
-function buildDesktop(source) {
-  const banner = `// Reconstructed readable BetterSongify bundle.\n// Generated from src/index.js by tools/build.js.\n`;
-  write(desktopOutputPath, `${banner}${source}`);
+// `--no-notifier` builds the desktop bundle for an install without
+// BetterSongifyNotifier.app (install-macos.sh --no-notifier): the script then
+// hides the menu-bar toggle and never calls the loopback companion. The flag is
+// a literal in src/index.js rather than a runtime probe so the panel is right
+// from its first render; a missing literal throws instead of silently shipping
+// a bundle that still expects the companion.
+const NOTIFIER_FLAG = "const NOTIFIER_COMPANION_INSTALLED = true;";
+
+function withoutNotifierCompanion(source) {
+  if (!source.includes(NOTIFIER_FLAG)) {
+    throw new Error(`Could not find "${NOTIFIER_FLAG}" in src/index.js for --no-notifier`);
+  }
+  return source.replace(NOTIFIER_FLAG, "const NOTIFIER_COMPANION_INSTALLED = false;");
+}
+
+function buildDesktop(source, { withNotifier }) {
+  const variant = withNotifier ? "" : "// Built with --no-notifier: no notifier companion.\n";
+  const banner = `// Reconstructed readable BetterSongify bundle.\n// Generated from src/index.js by tools/build.js.\n${variant}`;
+  write(desktopOutputPath, `${banner}${withNotifier ? source : withoutNotifierCompanion(source)}`);
 }
 
 function buildChrome(source) {
@@ -61,8 +77,11 @@ function buildChrome(source) {
   }
 }
 
-const targets = parseTargets(process.argv.slice(2));
+const args = process.argv.slice(2);
+const withNotifier = !args.includes("--no-notifier");
+const targets = parseTargets(args.filter((arg) => arg !== "--no-notifier"));
 const source = fs.readFileSync(sourcePath, "utf8");
 
-if (targets.includes("desktop")) buildDesktop(source);
+// The Chrome build never has a companion, so the flag only shapes desktop.
+if (targets.includes("desktop")) buildDesktop(source, { withNotifier });
 if (targets.includes("chrome")) buildChrome(source);

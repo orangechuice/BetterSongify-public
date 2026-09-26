@@ -26,7 +26,6 @@ private let menuBarHelperDefaultsKey = "menuBarUseHelper"
 private let menuBarHelperArgument = "--menubar-helper"
 private let snapshotNotificationName = Notification.Name("io.bettersongify.notifier.snapshot")
 private let actionNotificationName = Notification.Name("io.bettersongify.notifier.action")
-private let fieldSeparator = " |;| "
 // src/index.js aborts its desktop POST at 5000 ms. Pre-submission work must
 // cancel before that so its toast fallback cannot race a late native delivery.
 private let productionProcessingTimeout: TimeInterval = 4.0
@@ -217,8 +216,11 @@ final class SpotifyPlaybackMonitor {
     var onSpotifyLaunched: (() -> Void)?
     var onSpotifyTerminated: (() -> Void)?
 
-    static var isSpotifyRunning: Bool {
-        NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.spotify.client" }
+    static var isSpotifyRunning: Bool { spotifyProcessID != nil }
+
+    static var spotifyProcessID: pid_t? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.spotify.client")
+            .first { !$0.isTerminated }?.processIdentifier
     }
 
     func start() {
@@ -297,52 +299,94 @@ final class SpotifyPlaybackMonitor {
     }
 
     private func readSpotifySnapshot() -> PlaybackSnapshot {
-        // Load-bearing for the resident lifecycle, not just an optimisation: an
-        // AppleEvent to a stopped Spotify would launch it, so an app that is now
-        // alive at login must never send one before it sees Spotify running.
-        guard SpotifyPlaybackMonitor.isSpotifyRunning else {
+        guard let pid = SpotifyPlaybackMonitor.spotifyProcessID else { return .unavailable }
+        let spotify = SpotifyEvents(processIdentifier: pid)
+        do {
+            let status: PlaybackStatus
+            switch try spotify.get(SpotifyEvents.property("pPlS")).enumCodeValue {
+            case fourCharCode("kPSP"): status = .playing
+            case fourCharCode("kPSp"): status = .paused
+            case fourCharCode("kPSS"): return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .stopped)
+            default: return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .unknown)
+            }
+            // Resolved once and reused, as AppleScript's `set currentTrack to
+            // current track` did, so a track change mid-read cannot pair one
+            // song's title with the next song's artist.
+            let track = try spotify.get(SpotifyEvents.property("pTrk"))
+            guard track.descriptorType == DescType(typeObjectSpecifier) else {
+                return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .unknown)
+            }
+            // "player position" is a real in seconds. Track duration is an
+            // integer in MILLISECONDS (Spotify's dictionary, verified against the
+            // client August 2026) and is converted below.
+            let position = try spotify.get(SpotifyEvents.property("pPos")).doubleValue
+            let duration = try spotify.get(SpotifyEvents.property("pDur", of: track)).doubleValue
+            return PlaybackSnapshot(title: cleanMetadata(try spotify.text("pnam", of: track)),
+                                    artist: cleanMetadata(try spotify.text("pArt", of: track)),
+                                    album: cleanMetadata(try spotify.text("pAlb", of: track)),
+                                    artworkURL: validArtwork(try spotify.text("aUrl", of: track)), status: status,
+                                    position: max(0, position.isFinite ? position : 0),
+                                    duration: max(0, duration.isFinite ? duration / 1000 : 0))
+        } catch is SpotifyEvents.Gone {
             return .unavailable
-        }
-        // "player position" is a real in seconds; "div 1" truncates it to an
-        // integer without Standard Additions' round, whose terminology would
-        // have to resolve inside this application tell block, and without a
-        // locale-dependent decimal separator in the string form. Track duration
-        // is an integer in MILLISECONDS (Spotify's dictionary, verified against
-        // the client August 2026) and is converted below.
-        let source = """
-        tell application id "com.spotify.client"
-          try
-            set playerState to (player state as string)
-            if playerState is "stopped" then return playerState & "\(fieldSeparator)" & "" & "\(fieldSeparator)" & "" & "\(fieldSeparator)" & "" & "\(fieldSeparator)" & "" & "\(fieldSeparator)" & "0" & "\(fieldSeparator)" & "0"
-            set currentTrack to current track
-            set elapsedSeconds to ((player position) div 1) as string
-            set trackDuration to (duration of currentTrack) as string
-            return playerState & "\(fieldSeparator)" & name of currentTrack & "\(fieldSeparator)" & artist of currentTrack & "\(fieldSeparator)" & album of currentTrack & "\(fieldSeparator)" & artwork url of currentTrack & "\(fieldSeparator)" & elapsedSeconds & "\(fieldSeparator)" & trackDuration
-          on error
-            return "unknown\(fieldSeparator)\(fieldSeparator)\(fieldSeparator)\(fieldSeparator)\(fieldSeparator)\(fieldSeparator)"
-          end try
-        end tell
-        """
-        guard let script = NSAppleScript(source: source) else { return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .automationUnavailable) }
-        var error: NSDictionary?
-        let result = script.executeAndReturnError(&error)
-        guard error == nil, let value = result.stringValue else {
-            log("Spotify refresh failed: \(error?[NSAppleScript.errorMessage] ?? "unknown error")")
+        } catch {
+            log("Spotify refresh failed: \(error.localizedDescription)")
             return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .automationUnavailable)
         }
-        let parts = value.components(separatedBy: fieldSeparator)
-        guard parts.count == 7 else { return PlaybackSnapshot(title: nil, artist: nil, album: nil, artworkURL: nil, status: .unknown) }
-        let status: PlaybackStatus
-        switch parts[0].lowercased() {
-        case "playing": status = .playing
-        case "paused": status = .paused
-        case "stopped": status = .stopped
-        case "unknown": status = .automationUnavailable
-        default: status = .unknown
+    }
+}
+
+private func fourCharCode(_ code: String) -> FourCharCode {
+    code.utf8.reduce(0) { $0 << 8 | FourCharCode($1) }
+}
+
+// Spotify's scripting properties, read with AppleEvents addressed to its process
+// ID. Never address Spotify by bundle identifier here — AppleScript's
+// `tell application id`, NSAppleScript, or a bundle-ID target descriptor: an
+// event addressed that way LAUNCHES Spotify when it is not running, and no
+// running check closes the gap, because Spotify can exit between the check and
+// the event, or between two events of the same read. That is how quitting
+// Spotify used to bring it straight back: a read that raced the quit relaunched
+// it. An event to a process ID that has exited just fails.
+private struct SpotifyEvents {
+    struct Gone: Error {}
+    private let target: NSAppleEventDescriptor
+
+    init(processIdentifier: pid_t) { target = NSAppleEventDescriptor(processIdentifier: processIdentifier) }
+
+    // `property of container`; the null container is the application itself.
+    static func property(_ code: String, of container: NSAppleEventDescriptor = .null()) -> NSAppleEventDescriptor {
+        let specifier = NSAppleEventDescriptor.record()
+        specifier.setDescriptor(NSAppleEventDescriptor(typeCode: DescType(cProperty)), forKeyword: AEKeyword(keyAEDesiredClass))
+        specifier.setDescriptor(container, forKeyword: AEKeyword(keyAEContainer))
+        specifier.setDescriptor(NSAppleEventDescriptor(enumCode: DescType(formPropertyID)), forKeyword: AEKeyword(keyAEKeyForm))
+        specifier.setDescriptor(NSAppleEventDescriptor(typeCode: fourCharCode(code)), forKeyword: AEKeyword(keyAEKeyData))
+        return specifier.coerce(toDescriptorType: DescType(typeObjectSpecifier)) ?? specifier
+    }
+
+    // Default options include canInteract, which the one-time Automation
+    // consent prompt needs; the default timeout leaves the user time to answer it.
+    func get(_ specifier: NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
+        let event = NSAppleEventDescriptor(eventClass: AEEventClass(kAECoreSuite), eventID: AEEventID(kAEGetData),
+                                           targetDescriptor: target, returnID: AEReturnID(kAutoGenerateReturnID),
+                                           transactionID: AETransactionID(kAnyTransactionID))
+        event.setParam(specifier, forKeyword: AEKeyword(keyDirectObject))
+        let reply: NSAppleEventDescriptor
+        do {
+            reply = try event.sendEvent(options: .defaultOptions, timeout: TimeInterval(kAEDefaultTimeout))
+        } catch let error as NSError where error.code == procNotFound || error.code == connectionInvalid {
+            throw Gone()
         }
-        return PlaybackSnapshot(title: cleanMetadata(parts[1]), artist: cleanMetadata(parts[2]), album: cleanMetadata(parts[3]),
-                                artworkURL: validArtwork(parts[4]), status: status,
-                                position: max(0, Double(parts[5]) ?? 0), duration: max(0, (Double(parts[6]) ?? 0) / 1000))
+        if let code = reply.paramDescriptor(forKeyword: AEKeyword(keyErrorNumber))?.int32Value, code != 0 {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(code))
+        }
+        return reply.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) ?? .null()
+    }
+
+    // `missing value` arrives as a type descriptor: an absent value, not text.
+    func text(_ code: String, of container: NSAppleEventDescriptor) throws -> String? {
+        let value = try get(SpotifyEvents.property(code, of: container))
+        return value.descriptorType == DescType(typeType) ? nil : value.stringValue
     }
 }
 

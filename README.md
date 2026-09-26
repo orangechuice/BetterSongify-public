@@ -60,6 +60,15 @@ npm run reinstall:macos # Clean remove existing injection, then build and inject
 npm run remove:macos    # Remove the injection and restore stock Spotify
 ```
 
+By default the installer also sets up the notification companion described below. To install only the BetterSongify panel inside Spotify — no companion app, no macOS notifications, no menu-bar item — use the lite variants (or answer **N** when `./install-macos.sh` asks):
+
+```sh
+npm run install:macos:lite   # same as ./install-macos.sh install --no-notifier
+npm run reinstall:macos:lite # same as ./install-macos.sh reinstall --no-notifier
+```
+
+A lite install removes a companion left by an earlier full install, and its panel drops the **Show Song In Menu Bar** toggle. **Notify On Song Change** still works, as an in-app banner. Re-run `npm run install:macos` at any time to add the companion back.
+
 > **Note:** Spotify application updates will overwrite modified interface files. Simply re-run `npm run install:macos` after Spotify updates.
 
 ##### Song-change notifications (desktop)
@@ -74,7 +83,7 @@ times, both remembered afterwards:
 
 Notifications are attributed to *BetterSongify* rather than Spotify, because macOS ties notification permission to the app that posts them. The installer registers the companion to open at login; that registration is what brings the menu-bar item back after a restart, and it can be switched off in System Settings > General > Login Items. `npm run remove:macos` stops the companion, unregisters its login service, removes any legacy socket LaunchAgent, and removes the app.
 
-Building the helper needs the Xcode Command Line Tools (`xcode-select --install`). Without them everything else still works and song changes appear as an in-app banner instead.
+Building the helper needs the Xcode Command Line Tools (`xcode-select --install`). Without them everything else still works and song changes appear as an in-app banner instead. A lite install (above) skips the helper entirely and needs neither.
 
 ##### Signing the companion
 
@@ -104,6 +113,7 @@ sudo security delete-certificate -c "BetterSongify Local Signing" /Library/Keych
 ```sh
 npm run build        # Build both targets: dist/BetterSongify.js and dist/chrome/
 npm run build:desktop # Build only dist/BetterSongify.js (used by the macOS install)
+npm run build:desktop -- --no-notifier # Same, for an install without the companion
 npm run build:chrome # Build only dist/chrome/ (the Chrome extension)
 npm run check        # Syntax-check sources, rebuild, then syntax-check outputs
 npm run build:notifier # Build the macOS menu-bar companion

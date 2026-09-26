@@ -10,6 +10,11 @@
 #   ./install-macos.sh reinstall  remove completely, then build and install fresh
 #   ./install-macos.sh remove     remove completely
 #
+# Install and reinstall include the notifier companion (BetterSongifyNotifier.app:
+# macOS song-change notifications and the menu-bar song) unless given
+# --no-notifier, which installs only the script inside Spotify and removes a
+# companion left by an earlier full install. The interactive menu asks.
+#
 set -euo pipefail
 
 CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; GRAY=$'\033[90m'; RESET=$'\033[0m'
@@ -64,8 +69,14 @@ build_bundle() {
         exit 1
     fi
 
-    # Desktop target only: the macOS install never touches dist/chrome/.
-    (cd "$SCRIPT_DIR" && npm run build:desktop)
+    # Desktop target only: the macOS install never touches dist/chrome/. Without
+    # the companion the bundle is built to match, so its panel offers no
+    # menu-bar toggle and song changes go straight to the in-app toast.
+    if [ "$WITH_NOTIFIER" = true ]; then
+        (cd "$SCRIPT_DIR" && npm run build:desktop)
+    else
+        (cd "$SCRIPT_DIR" && npm run build:desktop -- --no-notifier)
+    fi
 
     if [ ! -f "$BUNDLE_FILE" ]; then
         error "Build did not produce $BUNDLE_FILE"
@@ -212,6 +223,12 @@ recover_notifier_upgrade() {
     # retain it rather than deleting the only recoverable installed bundle.
     [ -e "$NOTIFIER_APP" ] && rm -rf "$previous"
     rm -f "$legacy_backup"
+}
+
+# Anything an earlier full install could have left: the resident bundle, the
+# socket LaunchAgent before it, or the Application Support layout before that.
+notifier_is_present() {
+    [ -e "$NOTIFIER_APP" ] || [ -f "$NOTIFIER_PLIST" ] || [ -e "$NOTIFIER_LEGACY_SUPPORT" ]
 }
 
 probe_notifier() {
@@ -509,13 +526,54 @@ choose_operation() {
             done
             ;;
         *)
-            error "Unknown option: $choice (use 'install', 'reinstall', or 'remove')" >&2
+            error "Unknown option: $choice (use 'install', 'reinstall', or 'remove', optionally with --no-notifier)" >&2
             exit 1
             ;;
     esac
 }
 
+# Interactive counterpart of --no-notifier, asked only after the menu picked an
+# install. The full package is the default, so Return and unreadable input both
+# keep the companion.
+choose_notifier() {
+    echo " Install the notifier companion as well?" >&2
+    echo "   ${GREEN}[Y] Full package: song-change notifications and the menu-bar song (default)${RESET}" >&2
+    echo "   ${YELLOW}[N] Spotify only: no companion app, macOS notifications or menu-bar item${RESET}" >&2
+    echo "" >&2
+    local answer attempts=0
+    while [ "$attempts" -lt 5 ]; do
+        read -r -p " > Include companion? (Y/n): " answer || { echo true; return 0; }
+        answer=$(echo "$answer" | tr '[:lower:]' '[:upper:]' | xargs)
+        case "$answer" in
+            ""|Y|YES) echo true; return 0 ;;
+            N|NO) echo false; return 0 ;;
+        esac
+        attempts=$((attempts + 1))
+    done
+    warn "No valid input received. Defaulting to the full package." >&2
+    echo true
+}
+
 logo
+
+OPERATION_ARG=""
+WITH_NOTIFIER=""  # empty until decided: --no-notifier, the menu, or the full default
+for arg in "$@"; do
+    case "$arg" in
+        --no-notifier) WITH_NOTIFIER=false ;;
+        -*)
+            error "Unknown flag: $arg (the only flag is --no-notifier)"
+            exit 1
+            ;;
+        *)
+            if [ -n "$OPERATION_ARG" ]; then
+                error "Only one operation at a time: '$OPERATION_ARG' and '$arg' were both given."
+                exit 1
+            fi
+            OPERATION_ARG="$arg"
+            ;;
+    esac
+done
 
 SPOTIFY_APP="${SPOTIFY_APP:-}"
 [ -n "$SPOTIFY_APP" ] || SPOTIFY_APP=$(find_spotify) || {
@@ -534,12 +592,21 @@ LAUNCHER_BACKUP="$SPOTIFY_APP/Contents/MacOS/.bettersongify-stock-executable"
 if [ ! -w "$SPOTIFY_APPS_DIR" ]; then
     error "No write permission for $SPOTIFY_APPS_DIR"
     echo "     ${YELLOW}Re-run this installer with sudo:${RESET}"
-    echo "     ${YELLOW}sudo \"$0\" ${1:-}${RESET}"
+    echo "     ${YELLOW}sudo \"$0\" $*${RESET}"
     exit 1
 fi
 
-CHOICE=$(choose_operation "${1:-}")
+CHOICE=$(choose_operation "$OPERATION_ARG")
 echo ""
+
+if [ "$CHOICE" != "R" ] && [ -z "$WITH_NOTIFIER" ]; then
+    if [ -z "$OPERATION_ARG" ]; then
+        WITH_NOTIFIER=$(choose_notifier)
+        echo ""
+    else
+        WITH_NOTIFIER=true
+    fi
+fi
 
 TEMP_FOLDER=$(mktemp -d /tmp/BetterSongify_Extraction.XXXXXX)
 OUTPUT_ZIP="$TEMP_FOLDER.zip"
@@ -564,7 +631,9 @@ if [ "$CHOICE" = "R" ] || [ "$CHOICE" = "RI" ]; then
     cp -f "$SPA_FILE" "$EMERGENCY_BACKUP"
 
     info "Unpacking Spotify UI..."
-    unzip -qo "$SPA_FILE" -d "$TEMP_FOLDER"
+    # Not unzip: Spotify (seen on 1.3.0.277) ships xpui.spa with a bare "/" entry, and
+    # unzip exits 2 on it even though every file extracts, tripping set -e.
+    ditto -x -k "$SPA_FILE" "$TEMP_FOLDER"
 
     if [ ! -f "$TEMP_FOLDER/index.html" ]; then
         error "index.html was not found inside the package."
@@ -626,7 +695,7 @@ if [ "$CHOICE" = "I" ] || [ "$CHOICE" = "RI" ]; then
     fi
 
     info "Unpacking Spotify user interface..."
-    unzip -qo "$SPA_FILE" -d "$TEMP_FOLDER"
+    ditto -x -k "$SPA_FILE" "$TEMP_FOLDER"
 
     if [ ! -f "$TEMP_FOLDER/index.html" ]; then
         error "Failed to locate Spotify app layout."
@@ -661,7 +730,18 @@ if [ "$CHOICE" = "I" ] || [ "$CHOICE" = "RI" ]; then
     repack_spa "$TEMP_FOLDER" "$OUTPUT_ZIP"
     mv -f "$OUTPUT_ZIP" "$SPA_FILE"
 
-    install_notifier
+    if [ "$WITH_NOTIFIER" = true ]; then
+        install_notifier
+    else
+        info "Skipping the notifier companion: installing BetterSongify inside Spotify only."
+        # Switching down from a full install must not strand a resident menu-bar
+        # app and its login item that the new script no longer talks to.
+        if notifier_is_present; then
+            remove_notifier
+        else
+            warn_legacy_signing_identity
+        fi
+    fi
 
     trap cleanup EXIT
     success "Installation complete. Booting Spotify..."
@@ -669,6 +749,9 @@ if [ "$CHOICE" = "I" ] || [ "$CHOICE" = "RI" ]; then
 
     echo ""
     echo "${GRAY}Note: Spotify updates can overwrite BetterSongify. Re-run this installer after Spotify updates.${RESET}"
+    if [ "$WITH_NOTIFIER" != true ]; then
+        echo "${GRAY}To add notifications and the menu-bar song later, re-run the installer and include the companion.${RESET}"
+    fi
 fi
 
 echo ""
