@@ -79,8 +79,16 @@
     playerBar: "[data-testid=\"now-playing-bar\"], footer, .Root__now-playing-bar",
     // Player-bar track title/artist. Also the track-change signal for
     // auto-open lyrics (lyric-line hashing only works with lyrics open).
-    nowPlayingTitle: "[data-testid=\"context-item-info-title\"]",
-    nowPlayingArtist: "[data-testid=\"context-item-info-artist\"]",
+    // Spotify A/B-tests two player bars (October 2026, desktop 1.3.6 and the
+    // web player): the legacy one tags both with context-item-info-*; the
+    // now-playing-widget-v2 one tags only the byline (every artist, joined),
+    // so its title is matched as the widget's first dir="auto" text — ahead of
+    // the byline's names, the quality label, and the BPM badge.
+    nowPlayingTitle: [
+      "[data-testid=\"context-item-info-title\"]",
+      "[data-testid=\"now-playing-widget-v2\"] [dir=\"auto\"]:not([data-testid=\"now-playing-widget-v2-byline\"] *, [data-testid=\"context-item-info-quality\"] *)",
+    ].join(", "),
+    nowPlayingArtist: "[data-testid=\"context-item-info-artist\"], [data-testid=\"now-playing-widget-v2-byline\"]",
     // Player-bar album art, used only as the song-change notification's icon.
     // Strictly best-effort: getNowPlayingArtwork() falls back to scanning the
     // player bar for an i.scdn.co image, and a miss just means an icon-less
@@ -841,17 +849,13 @@
     state.lineObserver.observe(container, { childList: true, subtree: true });
   }
 
+  // No page-level fallback (h1, creator-link): those name whatever page is on
+  // screen — the sidebar's "Your Library" heading, or some other album — so a
+  // player-bar miss must read as "Unknown Song", not as a wrong song.
   function detectSongMetadata() {
-    const title =
-      document.querySelector(SELECTORS.nowPlayingTitle)?.textContent?.trim() ||
-      document.querySelector("h1")?.textContent?.trim() ||
-      "Unknown Song";
-    const artist =
-      document.querySelector(SELECTORS.nowPlayingArtist)?.textContent?.trim() ||
-      document.querySelector("[data-testid=\"creator-link\"]")?.textContent?.trim() ||
-      "Unknown Artist";
-    state.currentSongTitle = title;
-    state.currentArtist = artist;
+    const { title, artist } = getNowPlayingTrack();
+    state.currentSongTitle = title || "Unknown Song";
+    state.currentArtist = artist || "Unknown Artist";
   }
 
   // Track-change signal for once-per-track enforcement (auto-open lyrics,
